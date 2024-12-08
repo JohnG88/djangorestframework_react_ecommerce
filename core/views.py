@@ -5,11 +5,13 @@ import uuid
 #from datetime import datetime
 
 from django.conf import settings
-from django.contrib.auth import authenticate, login 
+from django.contrib.auth import authenticate, login, logout, get_user_model 
 from django.contrib.auth.models import AnonymousUser, User 
+from django.contrib.auth.password_validation import validate_password
 from django.contrib.sessions.models import Session
-from django.core.exceptions import ObjectDoesNotExist
+from django.core.exceptions import ObjectDoesNotExist, ValidationError as DjangoValidationError
 from django.core.mail import send_mail
+from django.http import HttpResponseRedirect
 from django.template.loader import render_to_string
 from django.utils import timezone
 from django.shortcuts import render
@@ -18,8 +20,9 @@ from django.http import JsonResponse, HttpResponse
 
 #from knox.views import LoginView as KnoxLoginView
 
-from rest_framework import status, viewsets
+from rest_framework import status, viewsets, serializers
 from rest_framework.decorators import api_view, permission_classes
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
@@ -28,35 +31,216 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .models import Customer, Product, Order, OrderItem, Address
-from .serializers import CustomerSerializer, ProductSerializer, OrderSerializer, OrderItemSerializer, AddressSerializer
+from .serializers import CustomerSerializer, ProductSerializer, OrderSerializer, OrderItemSerializer, AddressSerializer, ResetPasswordSerializer, PasswordResetConfirmSerializer
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
+# Get user
+# User = get_user_model()
 
 # Create your views here.
 
+
+""" ---OG View ---"""
+# class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
+#     email = serializers.EmailField()
+
+#     def validate_email(self, value):
+#         try:
+#             # Check if a user with the given email exists
+#             user = User.objects.get(email=value)
+#         except User.DoesNotExist:
+#             # Raise a validation error if the user with this email does not exist
+#             raise serializers.ValidationError("User with this email does not exist.")
+#         return value
+
+    # @classmethod
+    # def get_token(cls, user):
+    #     token = super().get_token(user)
+    #     token['username'] = user.username
+
+    #     return token
+
+""" ---Chatgpt version---"""
 class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
+    email = serializers.EmailField()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Remove the `username` field if it's present in the fields
+        self.fields.pop('username', None)
+
+    def validate(self, attrs):
+        email = attrs.get('email')
+        password = attrs.get('password')
+
+        # print(f"validating with email: {email} and password: {password}")
+
+        # Authenticate user by email
+        UserModel = get_user_model()
+
+        try:
+            user = UserModel.objects.get(email=email)
+            # print(f"user {user}")
+        except UserModel.DoesNotExist:
+            raise serializers.ValidationError({"detail": "Invalid credentials"})
+
+        # Check password
+        if not user.check_password(password):
+            raise serializers.ValidationError({"detail": "Invalid credentials"})
+
+        # Set the user on the serializer
+        self.user = user
+
+        # Create token without needing username
+        refresh = self.get_token(user)
+        data = {
+            'refresh': str(refresh),
+            'access': str(refresh.access_token),
+        }
+
+        # Add any extra fields (like email) to the token response
+        data['username'] = user.username
+
+        return data
+    
     @classmethod
     def get_token(cls, user):
         token = super().get_token(user)
-        token['username'] = user.username
-
+        token['username'] = user.username  # Add email to the token
         return token
-
+    
+"""--- Second ChatGPT version to fix login ---"""
 class MyTokenObtainPairView(TokenObtainPairView):
     serializer_class = MyTokenObtainPairSerializer
 
     def post(self, request, *args, **kwargs):
-        response = super().post(request, *args, **kwargs)
+        # Log the incoming request data
+        # print(f"Incoming request data: {request.data}")
 
-        #response.delete_cookie('my_cookie')
+        # Manually serialize the request data (email and password)
+        serializer = self.get_serializer(data=request.data)
+
+        try:
+            # Validate the serializer and trigger authentication
+            serializer.is_valid(raise_exception=True)
+
+            # Get the validated token data
+            data = serializer.validated_data
+            # print(f"Validated data: {data}")
+            
+            # Create the response
+            response = Response(data, status=status.HTTP_200_OK)
+
+            # After successful authentication, handle cookie setting
+            user = serializer.user
+            device_number = str(user.customer.device)
+
+            # Check if 'my_cookie' is present
+            my_cookie_value = request.COOKIES.get("my_cookie")
+
+            # If no cookie is present, set it to the user's device number
+            if my_cookie_value is None:
+                response.set_cookie('my_cookie', device_number, secure=True, samesite='None', path='/')
+
+            return response
+
+        except serializers.ValidationError as e:
+            # print(f"Validation error: {e.detail}")
+            return Response({"detail": "Invalid credentials"}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            # print(f"Unexpected error: {e}")
+            return Response({"detail": "An unexpected error occurred"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+        # OG Response for username/password login
+        """
+        user = authenticate(request, email=email, password=password)
+
+        print(f"login user {user}")
+
+        if user is not None:
+            device_number = str(user.customer.device)
+
+            # Check if the 'my_cookie' is present
+            my_cookie_value = request.COOKIES.get("my_cookie")
+
+            # Use the usual login process
+            response = super().post(request, *args, **kwargs)
+
+            if my_cookie_value is None:
+                # If no cookie, set the cookie to the user's device number
+                response.set_cookie('my_cookie', device_number, secure=True, samesite='None', path='/')
+            
+            return response
+        else:
+            return Response({"detail": "Invalid credentials"}, status=400)
+        """
+
+
+"""--- ChatGPT MyTokenObtainPairView function ---"""
+# class MyTokenObtainPairView(TokenObtainPairView):
+#     serializer_class = MyTokenObtainPairSerializer
+
+#     def post(self, request, *args, **kwargs):
+#         # Authenticate the user with provided credentials
+#         user = authenticate(username=request.data.get('username'), password=request.data.get('password'))
+
+#         if user is not None:
+#             # Retrieve the device number associated with the user
+#             device_number = str(user.customer.device)  # Assuming 'device_number' is the field in your model
+#             print(f"Logged in user device number: {device_number}")
+
+#             # Check if the 'my_cookie' is present
+#             my_cookie_value = request.COOKIES.get("my_cookie")
+
+#             if my_cookie_value is None:
+#                 # If no cookie, set the cookie to the user's device number
+#                 response = Response({"detail": "Login successful, cookie set"})
+#                 response.set_cookie('my_cookie', device_number, secure=True, samesite='None', path='/')
+#                 return response
+#             else:
+#                 # If cookie is present, proceed with usual login
+#                 response = super().post(request, *args, **kwargs)
+#                 return response
+#         else:
+#             return Response({"detail": "Invalid credentials"}, status=400)
+
+
+
+"""--- OG MyTokenObtainPairView function ---"""  
+# class MyTokenObtainPairView(TokenObtainPairView):
+#     serializer_class = MyTokenObtainPairSerializer
+
+#     def post(self, request, *args, **kwargs):
+#         response = super().post(request, *args, **kwargs)
+        
+#         if request.user.is_authenticated:
+#             # If the user is authenticated, retrieve the UUID of the logged-in user
+#             user_uuid = str(request.user.customer.uuid)  # Assuming 'uuid' is the field storing UUID in your user model
+#             print(f"logged in user uuid {user_uuid}")
+            
+#             # Set the user UUID as the value of the 'my_cookie' cookie
+#             response.set_cookie('my_cookie', user_uuid, secure=True, samesite='None', path='/')
+
+#         return response
+
+'''Removes cookie on login'''
+
+# class MyTokenObtainPairView(TokenObtainPairView):
+#     serializer_class = MyTokenObtainPairSerializer
+
+#     def post(self, request, *args, **kwargs):
+#         response = super().post(request, *args, **kwargs)
+
+#         #response.delete_cookie('my_cookie')
         
         
-        # Create a new cookie to delete the existing one
-        expiration_date = datetime.datetime.now() - datetime.timedelta(days=1)
-        response.set_cookie('my_cookie', '', expires=expiration_date, secure=True, samesite='None', path='/')
+#         # Create a new cookie to delete the existing one
+#         expiration_date = datetime.datetime.now() - datetime.timedelta(days=1)
+#         response.set_cookie('my_cookie', '', expires=expiration_date, secure=True, samesite='None', path='/')
 
-        return response
+#         return response
 
 #def HomeViewSet(viewsets.ModelViewSet):
 
@@ -74,14 +258,52 @@ class LoginView(KnoxLoginView):
             #return super().post(request, format=None)
         return Response({'detail': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
 """
+
 @api_view(['POST'])
-def create_user(request):
+def password_reset_view(request):
+    if request.method == 'POST':
+        serializer = ResetPasswordSerializer(data=request.data, context={'request': request})
+
+        if serializer.is_valid():
+            serializer.save()
+            return Response({'detail': 'Password reset email has been sent.'}, status=status.HTTP_200_OK)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+
+@api_view(['POST'])
+def password_reset_confirm_view(request):
+    serializer = PasswordResetConfirmSerializer(data=request.data)
+
+    if serializer.is_valid():
+        serializer.save()
+        return Response({'detail': 'Password has been reset successfully.'}, status=status.HTTP_200_OK)
+    
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['POST'])
+def logout_view(request):
+    logout(request)
+    response = HttpResponseRedirect('/')
+    response.delete_cookie('my_cookie')
+    return response
+
+@api_view(['POST'])
+def register_user(request):
     if request.method == 'POST':
         data = request.data
 
         username = data['username']
-        password = data['password']
         email = data['email']
+        password = data['password']
+
+        # Validate password complexity using Django's built-in password validators
+        try:
+            validate_password(password)
+        except DjangoValidationError as e:
+            # return Response({"error": e.messages}, status=status.HTTP_400_BAD_REQUEST)'
+            raise DRFValidationError(e.messages)
+
 
         #create new user
         user = User.objects.create_user(username=username, password=password, email=email)
@@ -94,9 +316,10 @@ def create_user(request):
 
         response = Response({'message': 'User created successfully'}, status=status.HTTP_201_CREATED)
 
+        "--- OG getting rid of cookie on registration ---"
         # Create a new cookie to delete the existing one
-        expiration_date = datetime.datetime.now() - datetime.timedelta(days=1)
-        response.set_cookie('my_cookie', '', expires=expiration_date, secure=True, samesite='None', path='/')
+        # expiration_date = datetime.datetime.now() - datetime.timedelta(days=1)
+        # response.set_cookie('my_cookie', '', expires=expiration_date, secure=True, samesite='None', path='/')
 
         '''
         # Delete the cookie in the response
@@ -111,29 +334,59 @@ def create_user(request):
         
 @api_view(['GET'])
 def get_user(request):
-    if request.method == 'GET':
-        user = request.user.customer
-        print(f"get user customer {user}")
-        serializer = CustomerSerializer(user, context={'request': request})
-        serialized_data = serializer.data
+    if request.user.is_authenticated:
+        if request.method == 'GET':
+            user = request.user.customer
+            # print(f"get user customer {user}")
+            serializer = CustomerSerializer(user, context={'request': request})
+            serialized_data = serializer.data
 
-        current_year = datetime.datetime.now().year
+            user_orders = Order.objects.filter(customer=user)
+            # print(f"user orders {user_orders}")
 
-        year = request.GET.get('year')
+            user_orders_serializer = OrderSerializer(user_orders, many=True, context={'request': request})
 
+            user_orders_serialized_data = user_orders_serializer.data
+
+            # print(f"user orders serializer {user_orders_serialized_data}")
+            
+            # Uncomment and use this block if needed in the future
+            # current_year = datetime.datetime.now().year
+            # year = request.GET.get('year')
+            # try:
+            #     year = int(year)
+            # except (ValueError, TypeError):
+            #     year = current_year
+            # user_orders = Order.objects.filter(customer=user, complete=True)
+            # user_order_serializer = OrderSerializer(user_orders, many=True,  context={'request': request})
+
+            return Response({'customer': serialized_data, 'orders': user_orders_serialized_data})
+        else:
+            return Response({'message': 'Cannot retrieve user.'})
+    else:
+        return Response({'message': 'User not authenticated.'}, status=401)
+
+@api_view(['GET'])
+def get_users(request):
+    if request.user.is_authenticated:
         try:
-            year = int(year)
-        except (ValueError, TypeError):
-            year = current_year
+            customer = request.user.customer
+        except ObjectDoesNotExist:
+            return Response({"message": "Customer not found"}, status=status.HTTP_404_NOT_FOUND)
+    else:
+        device = request.COOKIES.get("my_cookie")
+        try:
+            customer = Customer.objects.get(device=device)
+        except Customer.DoesNotExist:
+            return Response({'message': 'Device customer not found'}, status=status.HTTP_404_NOT_FOUND)
+    try:
+        customers = Customer.objects.all()
+    except Customer.DoesNotExist:
+        return Response({'message': 'Customers not found'}, status=status.HTTP_404_NOT_FOUND)
+    serializer = CustomerSerializer(customers, many=True)
+    serialized_data = serializer.data
 
-        user_orders = Order.objects.filter(customer=user, complete=True, date_ordered__year=year)
-
-        user_order_serializer = OrderSerializer(user_orders, many=True,  context={'request': request})
-
-        return Response({'customer': serialized_data, 'user_orders': user_order_serializer.data})
-    
-    return Response({'message': 'Cannot retrieve user.'})
-
+    return Response(serialized_data, status=status.HTTP_200_OK)
 
 @api_view(['GET'])
 def home(request):
@@ -191,11 +444,11 @@ def home(request):
 def cookie_monster(request):
     my_cookie_value = request.COOKIES.get('my_cookie')
 
-    if my_cookie_value:
-        print(f"my cookie {my_cookie_value}")
-    else:
-        print("Cookie 'my_cookie' does not exist")
-    return JsonResponse({'message':'Success'})
+    # if my_cookie_value:
+    #     # print(f"my cookie {my_cookie_value}")
+    # else:
+    #     # print("Cookie 'my_cookie' does not exist")
+    # return JsonResponse({'message':'Success'})
 
 @api_view(['GET'])
 def get_products(request):
@@ -250,7 +503,7 @@ def get_single_product(request, pk):
                 return HttpResponse('Existing customer retrieved')
             '''
             
-        print(f"customer stripe id {customer.customer_stripe_id}")
+        # print(f"customer stripe id {customer.customer_stripe_id}")
         if customer.customer_stripe_id:
             print(f"Stripe customer id exists")
         else:
@@ -266,7 +519,7 @@ def get_single_product(request, pk):
             customer.save()
 
         order, created = Order.objects.get_or_create(customer=customer, complete=False)
-        print(f"single product order {order}")
+        # print(f"single product order {order}")
         
         order_items_in_order = order.orderitem_set.all()
         if order_items_in_order.exists():
@@ -280,20 +533,20 @@ def get_single_product(request, pk):
             print(f"No order items in order.")
 
         orderItem, created = OrderItem.objects.get_or_create(order=order, product=product)
-        print(f"order item quantity on create {orderItem.quantity}")
+        # print(f"order item quantity on create {orderItem.quantity}")
 
         data = request.data
         #print(f"create order item data {data}")
 
         quantity = data['quantity']
-        print(f"quantity from frontend", quantity)
+        # print(f"quantity from frontend", quantity)
 
         #print(f"quantity {quantity}")
 
         orderItem.quantity += int(quantity)
         orderItem.save()
 
-        print(f"order item quantity after save {orderItem.quantity}")
+        # print(f"order item quantity after save {orderItem.quantity}")
 
         #product.quantity = product.quantity - int(quantity)
         #product.save()
@@ -339,7 +592,7 @@ def merge_guest_cart_with_user(request):
                 # Check if the item already exists in the user's order
                 existing_item, created = OrderItem.objects.get_or_create(order=user_order, product=anon_item.product, quantity=anon_item.quantity)
 
-                print(f"anon item quantity", anon_item.quantity)
+                # print(f"anon item quantity", anon_item.quantity)
                 
                 if not created:
                     # If the item already exists, update its quantity or any other relevant fields
@@ -509,22 +762,47 @@ def order(request):
     order_items_in_order = order.orderitem_set.all()
 
     if order_items_in_order.exists():
-        print(f"order from order view {order}")
+        # print(f"order from order view {order}")
         for item in order.orderitem_set.all():
-            print()
-            print()
             print(f"item id {item.id} item quantity {item.quantity}")
-            print()
-            print()
     else:
         print(f"No order items in Order from order function")
 
     serializer = OrderSerializer(order, context={"request": request})
     serialized_data = serializer.data
 
+    # print(f"order {serialized_data}")
+
     return Response(serialized_data, status=status.HTTP_200_OK)
 
-@api_view(['patch', 'delete'])
+
+@api_view(['GET'])
+def get_order_by_year(request):
+    if request.method == 'GET':
+        user = request.user.customer
+        # print(f"order year user {user}")
+
+        current_year = datetime.datetime.now().year
+
+        year = request.GET.get('year')
+        # print(f"year {year}")
+
+        try:
+            year = int(year)
+        except (ValueError, TypeError):
+            year = current_year
+
+        user_year_orders = Order.objects.filter(customer=user, complete=True, date_ordered__year=year)
+
+        if user_year_orders.exists():
+            user_year_orders_serializer = OrderSerializer(user_year_orders, many=True, context={'request': request})
+            return Response({'user_year_orders_serializer': user_year_orders_serializer.data}, status=status.HTTP_200_OK)
+        else:
+            return Response({'message': "No orders found for the specified year."}, status=status.HTTP_404_NOT_FOUND)
+    else:
+        return Response({'message': "Invalid request method."}, status=status.HTTP_400_BAD_REQUEST)
+
+@api_view(['PATCH', 'delete'])
 def update_order_item(request, pk):
     '''
     if request.user.is_authenticated:
@@ -539,7 +817,7 @@ def update_order_item(request, pk):
     if request.user.is_authenticated:
         try:
             customer = request.user.customer
-            print(f"customer does exist {customer}")
+            # print(f"customer does exist {customer}")
         except ObjectDoesNotExist:
             return Response({'message': 'Customer not found'}, status=status.HTTP_404_NOT_FOUND)
     else:
@@ -561,11 +839,13 @@ def update_order_item(request, pk):
         return Response({'message': 'Order not found'}, status=status.HTTP_404_NOT_FOUND)
     
     order_item = OrderItem.objects.get(id=pk)
-    print(f"order item product id {order_item.product.id}")
+    # print(f"order item product id {order_item.product.id}")
 
     if request.method == 'PATCH':
-
+        
+        # print(f"request {request.data}")
         data = request.data
+        # print(f"data {data}")
 
         new_quantity = int(data['quantity'])
         #order_item.quantity = int(data['quantity'])
@@ -573,7 +853,7 @@ def update_order_item(request, pk):
         #quantity_difference = new_quantity - order_item.quantity
 
         # Update product quantity
-        print(f"order item quantity before save {order_item.quantity}")
+        # print(f"order item quantity before save {order_item.quantity}")
         
         """
         product = Product.objects.get(id=order_item.product.id)
@@ -593,7 +873,7 @@ def update_order_item(request, pk):
             print(f"order item quantity has been updated.")
         
 
-        print(f"order item {order_item}")
+        # print(f"order item {order_item}")
 
         serializer = OrderItemSerializer(order_item, context={"request": request})
         serialized_data = serializer.data
@@ -613,16 +893,16 @@ def update_order_item(request, pk):
 def delete_order_item(request, pk):
     if request.user.is_authenticated:
         customer = request.user.customer
-        print(f"customer {customer}")
+        # print(f"customer {customer}")
     else:
         device = request.COOKIES.get('my_cookie')
-        print(f"my cookie {device}")
+        # print(f"my cookie {device}")
         customer, created = Customer.objects.get_or_create(device=device)
 
     order = Order.objects.get(customer=customer.id, complete=False)
-    print(f"order {order}")
+    # print(f"order {order}")
     order_item = OrderItem.objects.get(id=pk)
-    print(f"order item order {order_item.order.id}")
+    # print(f"order item order {order_item.order.id}")
 
     product_id = order_item.product.id
 
@@ -641,7 +921,7 @@ def delete_order_item(request, pk):
         order_item.delete()
         #order_item.save()
 
-        print(f"order item id", order_item_id)
+        # print(f"order item id", order_item_id)
         if order.orderitem_set.count() == 0:
             order.delete()
 
@@ -662,7 +942,7 @@ def submit_order_and_stripe_payment(request):
             customer, created = Customer.objects.get_or_create(device=device)
 
         order = Order.objects.get(customer=customer.id, complete=False)
-        print(f"Order {order}")
+        # print(f"Order {order}")
 
         order_items = OrderItem.objects.filter(order=order)
 
@@ -690,11 +970,13 @@ def submit_order_and_stripe_payment(request):
         #address = Address.objects.get(customer=customer, complete=False)
 
         data = request.data
+        # print(f"order data", data)
         payment_method_id = data['payment_method_id']
+        address_type = data['address_type']
         first_name = data['first_name']
         last_name = data['last_name']
         email = data['email']
-        print(f"email {email}")
+        # print(f"email {email}")
         street_address = data['street_address']
         apt = data['apt']
         city = data['city']
@@ -702,20 +984,21 @@ def submit_order_and_stripe_payment(request):
         zipcode = data['zipcode']
         is_checked = data['is_checked']
         total_with_tax = data['total_with_tax']
-        print(f"is_checked {is_checked}")
+        # print(f"is_checked {is_checked}")
+        # print(f"total_with_tax {total_with_tax}")
 
         update_anon_customer_email_on_purchase = stripe.Customer.modify(
             customer.customer_stripe_id,
             email=email,
         )
 
-        print(f"updated customer email {update_anon_customer_email_on_purchase}")
+        # print(f"updated customer email {update_anon_customer_email_on_purchase}")
 
         stripe_payment_intent = stripe.PaymentIntent.create(
             customer=customer.customer_stripe_id,
             payment_method=payment_method_id,
             currency='usd',
-            amount=int(total_with_tax * 100),
+            amount=int(order.get_cart_total * 100),
             automatic_payment_methods={
                 'enabled': True,
                 'allow_redirects': 'never',
@@ -723,14 +1006,15 @@ def submit_order_and_stripe_payment(request):
             confirm=True
         )
 
-        print(f"stripe payment intent {stripe_payment_intent}")
+        # print(f"stripe payment intent {stripe_payment_intent}")
 
-        address_type = request.data.get('address_type')
+        # address_type = request.data.get('address_type')
         address_type_id = request.data.get('id')
-        print(f"address type id {address_type_id}")
+        # print(f"address type {address_type}")
+        # print(f"address type id {address_type_id}")
         
 
-        if address_type_id == '':
+        if address_type_id == 0:
             shipping_address = Address(
                 customer=customer,
                 is_active=True,
@@ -754,11 +1038,13 @@ def submit_order_and_stripe_payment(request):
         order.last_name = last_name
         order.user_email = email
         order.shipping_address = shipping_address
+        order.complete=True
         #order.shipping_address = f"{street_address}, Apt {apt}, {city}, {state}, {zipcode}"
         if is_checked:
             order.billing_address = order.shipping_address
-        order.complete=True
         order.save()
+
+        # print(f"order complete {order.complete}")
 
         serializer = OrderSerializer(order, context={"request": request})
         
@@ -784,27 +1070,29 @@ def submit_order_and_stripe_payment(request):
         # 8086bd96-a87c-4fdf-b74b-b602e9b9303b
 
 @api_view(['POST'])
-def update_billing_address(request):
+def create_billing_address(request):
     if request.method == 'POST':
         if request.user.is_authenticated:
             customer = request.user.customer
         else:
             device = request.COOKIES.get('my_cookie')
-            print(f"device {device}")
+            # print(f"device {device}")
 
             customer, created = Customer.objects.get_or_create(device=device)
-            print(f"customer device {customer}")
+            # print(f"customer device {customer}")
 
-        print(f"customer {customer}")
+        # print(f"customer {customer}")
 
         order = Order.objects.get(customer=customer.id, complete=False)
-        print(f"order shipping address {order.shipping_address}")
+        # print(f"order shipping address {order.shipping_address}")
 
         data = request.data
-        print(f"billing data {request.data}")
+        # print(f"billing data {request.data}")
 
         
         address_type = request.data.get('address_type')
+        address_id = request.data.get('id')
+        # print(f"billing address id {address_id}")
 
     
 
@@ -818,26 +1106,32 @@ def update_billing_address(request):
 
         if serializer.is_valid():
             
+            if address_id == "":
+
 
             
-            new_address = Address(
-                customer=customer,
-                is_active=True,
-                address_type=address_type,
-                first_name = serializer.validated_data.get('first_name'),
-                last_name = serializer.validated_data.get('last_name'),
-                street_address = serializer.validated_data.get('street_address'),
-                apt = serializer.validated_data.get('apt'),
-                city=serializer.validated_data.get('city'),
-                state=serializer.validated_data.get('state'),
-                zipcode=serializer.validated_data.get('zipcode')
-            )
-            new_address.save()
+                billing_address = Address(
+                    customer=customer,
+                    is_active=True,
+                    address_type=address_type,
+                    first_name = serializer.validated_data.get('first_name'),
+                    last_name = serializer.validated_data.get('last_name'),
+                    street_address = serializer.validated_data.get('street_address'),
+                    apt = serializer.validated_data.get('apt'),
+                    city=serializer.validated_data.get('city'),
+                    state=serializer.validated_data.get('state'),
+                    zipcode=serializer.validated_data.get('zipcode')
+                )
+                billing_address.save()
+
+                
+            else:
+                billing_address = Address.objects.get(id=address_id)
 
             if address_type == 'billing':
-                order.billing_address = new_address
+                order.billing_address = billing_address
             elif address_type == 'shipping':
-                order.shipping_address = new_address
+                order.shipping_address = billing_address
 
             order.save()
             
@@ -846,55 +1140,53 @@ def update_billing_address(request):
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         
 
-
-        
-@api_view(['PUT'])
+@api_view(['PATCH'])
 def edit_shipping_billing_address(request):
     if request.user.is_authenticated:
         user = request.user.customer
-
         data = request.data
-        print(f"edit data {data}")
 
-        address_id = data['id']
-        print(f"address_id {address_id}")
+        try:
+            address_data = data
+            # print(f"edit address data", data)
+            address_id = data['id']
+            first_name = data['first_name']
+            # print(f"edit first name address", first_name)
+            address = Address.objects.get(id=address_id)
+
+            address_serializer = AddressSerializer(instance=address, data=data, partial=True)
+
+            if address_serializer.is_valid():
+                address_serializer.save()
+                return Response(address_serializer.data, status=status.HTTP_200_OK)
+            else:
+                return Response(address_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        except Address.DoesNotExist:
+            return Response({'error': 'Address not found'}, status=status.HTTP_404_NOT_FOUND)
+        except KeyError:
+            return Response({'error': 'Address ID is required'}, status=status.HTTP_400_BAD_REQUEST)
+    return Response({'error': 'User not authenticated'}, status=status.HTTP_401_UNAUTHORIZED)
+
         
-        address = Address.objects.get(id=address_id)
-        print(f"address {address}")
-
-        address_serializer = AddressSerializer(instance=address, data=data)
-        print(f"address_serializer {address_serializer}")
-
-        if address_serializer.is_valid():
-            address_serializer.save()
-            print(f"saved address_serializer {address_serializer}")
-
-            return Response(address_serializer.data, status=status.HTTP_200_OK)
-        else:
-            print(f"validation errors: {address_serializer.errors}")
-            return Response(address_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        
 
         
         
+
 @api_view(['GET'])
 def get_billing_shipping_address(request):
     if request.user.is_authenticated:
         user = request.user.customer
         
         user_shipping_address = Address.objects.filter(customer=user, address_type='shipping', is_active=True).first()
-        
         user_billing_address = Address.objects.filter(customer=user, address_type='billing', is_active=True).first()
 
-        if user_shipping_address or user_billing_address:
-            shipping_address_serializer = AddressSerializer(user_shipping_address)
-            
-            billing_address_serializer = AddressSerializer(user_billing_address)
+        shipping_address_data = AddressSerializer(user_shipping_address).data if user_shipping_address else None
+        billing_address_data = AddressSerializer(user_billing_address).data if user_billing_address else None
 
-            return Response({'shipping_address':shipping_address_serializer.data, 'billing_address': billing_address_serializer.data}, status=status.HTTP_200_OK)
-
-        else:
-            return Response({'message': 'No Shipping or billing available.'}, status=status.HTTP_200_OK)
+        return Response({
+            'shipping_address': shipping_address_data,
+            'billing_address': billing_address_data
+        }, status=status.HTTP_200_OK)
     else:
         return Response({'message': 'User is not authenticated.'}, status=status.HTTP_401_UNAUTHORIZED)
 
@@ -907,7 +1199,7 @@ def search_for_submitted_order(request):
 
         try:
             order = Order.objects.get(id=order_number, user_email=email, complete=True)
-            print(f"order items {order.orderitem_set.all()}")
+            # print(f"order items {order.orderitem_set.all()}")
             
             if order:
                 
@@ -956,7 +1248,7 @@ def return_single_order_item(request, pk):
     
     if request.method == 'PATCH':
         item_updates = request.data.get('order_items', []) # Get the list of item updates from the request data
-        print(f"item updates {item_updates}")
+        # print(f"item updates {item_updates}")
         updated_items = []
 
         #data_from_frontend = item_updates['order_items']
@@ -968,7 +1260,7 @@ def return_single_order_item(request, pk):
 
             try:
                 order_item = OrderItem.objects.get(id=item_id)
-                print("order item product detail image", order_item.product.image)
+                # print("order item product detail image", order_item.product.image)
 
                 if quantity_returned > order_item.quantity:
                     print(f"{quantity_returned} is greater than {order_item.quantity}")
@@ -994,6 +1286,8 @@ def return_single_order_item(request, pk):
 
             except OrderItem.DoesNotExist:
                 return Response({'message': 'Order item does not exist'}, status=status.HTTP_404_NOT_FOUND)
-        print(f"updated items {updated_items}")
+        # print(f"updated items {updated_items}")
         return Response({'message': 'Items returned successfully.', 'updated_items': updated_items}, status=status.HTTP_200_OK)
         
+
+

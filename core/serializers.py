@@ -1,6 +1,12 @@
+from django.core.mail import send_mail
 from django.contrib.auth.models import User
+# from django.contrib.auth.forms import PasswordResetForm
+from django.contrib.auth.tokens import default_token_generator, PasswordResetTokenGenerator
+from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
+from django.utils.encoding import force_bytes
 
 from rest_framework import serializers
+from django.urls import reverse
 
 from .models import Customer, Product, Order, OrderItem, Address
 
@@ -25,6 +31,65 @@ class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ['id', 'username', 'email']
+
+class ResetPasswordSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+    def validate_email(self, value):
+        try:
+            user = User.objects.get(email=value)
+        except User.DoesNotExist:
+            raise serializers.ValidationError("User with this email does not exist.")
+        return value
+
+    def save(self, **kwargs):
+        request = self.context.get('request')
+        email = self.validated_data['email']
+        user = User.objects.get(email=email)
+
+        # Generate password reset token and uid
+        token_generator = PasswordResetTokenGenerator()
+        token = token_generator.make_token(user)
+        uid = urlsafe_base64_encode(force_bytes(user.pk))
+
+        # Construct password reset link (frontend URL)
+        reset_url = f"http://localhost:3000/reset-password-confirm/{uid}/{token}"
+
+        # Send email with the reset link
+        subject = "Password Reset Request"
+        message = f"Follow the link to reset your password: {reset_url}"
+        send_mail(subject, message, 'noreply@example.com', [user.email])
+
+        return user
+
+class PasswordResetConfirmSerializer(serializers.Serializer):
+    uidb64 = serializers.CharField()
+    token = serializers.CharField()
+    new_password = serializers.CharField(write_only=True)
+
+    def validate(self, attrs):
+        try:
+            uid = urlsafe_base64_decode(attrs['uidb64']).decode()
+            user = User.objects.get(pk=uid)
+        except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+            raise serializers.ValidationError('Invalid user ID or token.')
+        
+        # Check if token is valid
+        if not default_token_generator.check_token(user, attrs['token']):
+            raise serializers.ValidationError('Invalid Token.')
+        
+        # Check if new password is the same as current password
+        if user.check_password(attrs['new_password']):
+            raise serializers.ValidationError('New password cannot be the same as the current password.')
+        
+        return attrs
+    
+    def save(self):
+        uid = urlsafe_base64_decode(self.validated_data['uidb64']).decode()
+        user = User.objects.get(pk=uid)
+        user.set_password(self.validated_data['new_password'])
+        user.save()
+        return user
 
 class CustomerSerializer(serializers.ModelSerializer):
     user = UserSerializer(read_only=True)
@@ -69,7 +134,7 @@ class OrderItemSerializer(serializers.ModelSerializer):
     product_detail = ProductSerializer(source='product', read_only=True)
     class Meta:
         model = OrderItem
-        fields = ['id', 'product_detail', 'order', 'quantity', 'item_amount_returning', 'item_process_return_initiated', 'item_returned', 'all_items_returned', 'partial_returned']
+        fields = ['id', 'product_detail', 'order', 'quantity', 'item_amount_returning', 'item_process_return_initiated', 'item_returned', 'all_items_returned', 'partial_returned', 'get_total']
 
     '''
     def to_representation(self, instance):

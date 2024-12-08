@@ -8,7 +8,7 @@ from decimal import Decimal
 class Customer(models.Model):
     user = models.OneToOneField(User, null=True, blank=True, on_delete=models.CASCADE)
     name = models.CharField(max_length=200, null=True, blank=True)
-    email = models.CharField(max_length=200, null=True, blank=True)
+    email = models.CharField(max_length=200, null=True, blank=True, unique=True)
     device = models.CharField(max_length=200, null=True, blank=True)
     customer_stripe_id = models.CharField(max_length=300, null=True, blank=True)
     avatar = models.ImageField(default='avatar.png', upload_to="avatar_image", validators=[FileExtensionValidator(['png', 'jpg', 'jpeg'])])
